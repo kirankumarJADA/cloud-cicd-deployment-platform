@@ -1,0 +1,35 @@
+# ---- Secrets (never commit) ----
+.env
+*.env
+!.env.example
+*.pem
+*.key
+id_rsa*
+secrets/
+
+# ---- Java / Maven ----
+backend/target/
+*.class
+hs_err_pid*
+# Keep the Maven wrapper committed (mvnw, mvnw.cmd, .mvn/) — do NOT ignore it.
+
+# ---- Node / Vite ----
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ---- Docker ----
+*.tar
+
+# ---- IDE / OS ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+logs/

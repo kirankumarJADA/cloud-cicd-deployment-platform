@@ -1,0 +1,233 @@
+name: CI/CD Pipeline
+
+# -----------------------------------------------------------------------------
+# Flow:
+#   push to main
+#     -> backend-test  ┐ (parallel)
+#     -> frontend-build ┘
+#         -> docker-build (matrix: backend, frontend)
+#             -> image-push (only on main)
+#                 -> deploy-production (SSH to the Linux VM)
+#
+# Pull requests run tests + build + image-build only (no push, no deploy),
+# so the pipeline doubles as branch protection / CI for feature branches.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # 1. Backend tests — fails the whole pipeline on any test failure.
+  # ===========================================================================
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Run backend test suite
+        working-directory: backend
+        run: ./mvnw -B clean verify
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-surefire-reports
+          path: backend/target/surefire-reports/
+          retention-days: 7
+
+  # ===========================================================================
+  # 2. Frontend build validation — runs in parallel with backend-test.
+  # ===========================================================================
+  frontend-build:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci || npm install
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Production build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ===========================================================================
+  # 3. Docker image build — validates both Dockerfiles build cleanly.
+  #    Matrix runs backend & frontend builds in parallel.
+  # ===========================================================================
+  docker-build:
+    name: Docker Build (${{ matrix.service }})
+    needs: [backend-test, frontend-build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push, cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: false
+          tags: cloud-cicd-${{ matrix.service }}:ci-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ===========================================================================
+  # 4. Push images to GitHub Container Registry — main branch only.
+  # ===========================================================================
+  image-push:
+    name: Push Images
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (sha + latest tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cloud-cicd-${{ matrix.service }}:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cloud-cicd-${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # ===========================================================================
+  # 5. Deploy to the production Linux VM over SSH.
+  # ===========================================================================
+  deploy-production:
+    name: Deploy to Production
+    needs: image-push
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync deployment files to VM
+        run: |
+          scp -i ~/.ssh/deploy_key -r \
+            deployment nginx scripts \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/cloud-cicd-deployment-platform/"
+
+      - name: Render production .env from secrets
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "cat > /opt/cloud-cicd-deployment-platform/deployment/.env" <<EOF
+          REGISTRY=${{ env.REGISTRY }}
+          IMAGE_OWNER=${{ env.IMAGE_OWNER }}
+          IMAGE_TAG=sha-${{ github.sha }}
+          DATABASE_NAME=appdb
+          DATABASE_USERNAME=appuser
+          DATABASE_PASSWORD=${{ secrets.DATABASE_PASSWORD }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          JWT_EXPIRATION_SECONDS=3600
+          APP_VERSION=${{ github.sha }}
+          APP_ENVIRONMENT=production
+          EOF
+
+      - name: Authenticate VM to the registry
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "echo '${{ secrets.DOCKER_PASSWORD }}' | docker login ${{ env.REGISTRY }} -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin"
+
+      - name: Run health-gated deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "chmod +x /opt/cloud-cicd-deployment-platform/scripts/deploy.sh && \
+             APP_DIR=/opt/cloud-cicd-deployment-platform \
+             /opt/cloud-cicd-deployment-platform/scripts/deploy.sh"
+
+      - name: Post-deploy smoke test
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "chmod +x /opt/cloud-cicd-deployment-platform/scripts/health-check.sh && \
+             BASE_URL=http://localhost /opt/cloud-cicd-deployment-platform/scripts/health-check.sh"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image tag | \`sha-${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | \`${{ secrets.SSH_HOST }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | ${{ job.status }} |" >> "$GITHUB_STEP_SUMMARY"
