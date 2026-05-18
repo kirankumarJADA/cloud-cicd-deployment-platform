@@ -194,6 +194,10 @@ docs/                architecture · deployment · local-development · troubles
 - [Troubleshooting](docs/troubleshooting.md) — pipeline & runtime failure modes
 - [Monitoring](monitoring/README.md) — metrics, probes, reliability mechanisms
 
+## Deployment Note
+
+The production deployment stage requires a configured Linux VM (e.g., AWS EC2) and GitHub repository secrets for SSH access. CI, Docker image builds, and registry publishing are fully functional.
+
 ## Screenshots
 
 The operations console renders a control-room dashboard (live service health,
